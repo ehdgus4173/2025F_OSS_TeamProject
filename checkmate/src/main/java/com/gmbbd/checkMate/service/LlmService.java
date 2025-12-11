@@ -2,13 +2,16 @@ package com.gmbbd.checkMate.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.gmbbd.checkMate.exception.ApiException;
 import com.gmbbd.checkMate.model.EvaluationResult;
+import com.gmbbd.checkMate.util.MarkdownCleaner;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+
 import reactor.core.publisher.Mono;
 
 import java.io.IOException;
@@ -16,110 +19,110 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
 public class LlmService {
 
-    private final WebClient openAiWebClient;   // OpenAIConfig
-    private final ObjectMapper objectMapper;   // 스프링 Bean
+    private final WebClient openAiWebClient;
+    private final ObjectMapper objectMapper;
+    private final MarkdownCleaner markdownCleaner;
 
     @Value("${openai.model:gpt-4o-mini}")
     private String model;
 
-    public EvaluationResult evaluateRequirement(String requirementText, String documentText) {
-        // 프롬프트 생성
-        String prompt = buildPrompt(requirementText, documentText);
+    // JSON 감지를 위한 정규식
+    private static final Pattern JSON_EXTRACT_PATTERN =
+            Pattern.compile("\\{[\\s\\S]*?}", Pattern.MULTILINE);
 
-        // OpenAI 요청
-        Map<String, Object> requestBody = Map.of(
-                "model", model,
-                "temperature", 0,
-                "messages", List.of(
-                        Map.of(
-                                "role", "user",
-                                "content", prompt
-                        )
-                )
-        );
+    // Retry 횟수
+    private static final int MAX_RETRY = 2;
 
-        // WebClient 호출
-        String rawResponse = openAiWebClient.post()
-                .uri("/chat/completions")
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(requestBody)
-                .retrieve()
-                .bodyToMono(String.class)
-                .onErrorResume(e ->
-                        Mono.error(new RuntimeException("OpenAI API 호출 실패: " + e.getMessage(), e))
-                )
-                .block();
 
-        // JSON 파싱 → EvaluationResult
-        return parseEvaluationResult(rawResponse, requirementText, null);
-    }
-
-    private String buildPrompt(String req, String submission) {
-        String safeReq = (req == null) ? "" : req.trim();
-        String safeSubmission = (submission == null) ? "" : submission;
-
-        // 공백 정리
-        String normalizedReq = normalizeText(safeReq);
-        String normalizedSubmission = normalizeText(safeSubmission);
+    public EvaluationResult evaluateRequirement(String requirementMarkdown, String submissionMarkdown) {
 
         try {
-            ClassPathResource resource =
-                    new ClassPathResource("prompts/llm_prompt.txt");
+            String submissionClean = markdownCleaner.cleanForLLM(submissionMarkdown);
+            String requirementClean = requirementMarkdown == null ? "" : requirementMarkdown.trim();
+            String prompt = buildPrompt(requirementClean, submissionClean);
+
+            String rawResponse = callOpenAIWithRetry(prompt);
+
+            return parseEvaluationResult(rawResponse, requirementMarkdown, null);
+
+        } catch (Exception e) {
+            throw new ApiException("LLM 평가 중 오류 발생: " + e.getMessage());
+        }
+    }
+
+    private String callOpenAIWithRetry(String prompt) {
+
+        Exception lastError = null;
+
+        for (int attempt = 0; attempt <= MAX_RETRY; attempt++) {
+
+            try {
+                Map<String, Object> requestBody = Map.of(
+                        "model", model,
+                        "temperature", 0,
+                        "messages", List.of(
+                                Map.of("role", "user", "content", prompt)
+                        )
+                );
+
+                return openAiWebClient.post()
+                        .uri("/chat/completions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(requestBody)
+                        .retrieve()
+                        .bodyToMono(String.class)
+                        .block();
+
+            } catch (Exception e) {
+                lastError = e;
+
+                if (attempt == MAX_RETRY) {
+                    throw new ApiException("OpenAI 호출 실패: " + e.getMessage());
+                }
+
+                // exponential backoff 가능하지만 단순 sleep도 충분
+                try {
+                    Thread.sleep(300L * (attempt + 1));
+                } catch (InterruptedException ignored) {}
+            }
+        }
+
+        throw new ApiException("OpenAI 호출 실패: " + (lastError != null ? lastError.getMessage() : ""));
+    }
+
+    private String buildPrompt(String reqMd, String submissionMd) {
+
+        try {
+            ClassPathResource resource = new ClassPathResource("prompts/llm_prompt.txt");
 
             try (InputStream is = resource.getInputStream()) {
                 String template = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-                // 프롬프트의 %s 두 군데에 순서대로 요구사항, 문서내용 채우기
-                return template.formatted(normalizedReq, normalizedSubmission);
+                return template.formatted(reqMd, submissionMd);
             }
+
         } catch (IOException e) {
-            throw new IllegalStateException(
-                    "프롬프트 템플릿(prompts/llm_prompt.txt)을 읽는 데 실패했습니다.", e
-            );
+            throw new ApiException("프롬프트 템플릿 로딩 실패: " + e.getMessage());
         }
     }
 
-    /**
-     * 공백/개행/탭을 하나의 공백으로 줄이고 양 끝 공백 제거
-     * 내용 X, 표현만 정리
-     */
-    private String normalizeText(String text) {
-        if (text == null) {
-            return "";
-        }
-        return text
-                .replaceAll("\\s+", " ")
-                .trim();
-    }
-
-    /**
-     * OpenAI 응답(JSON 문자열)을 EvaluationResult로 변환
-     *
-     * JSON 형식:
-     * {
-     *   "status": "FULFILLED",
-     *   "score": 0.85,
-     *   "matchedKeywordCount": 5,
-     *   "totalKeywordCount": 6,
-     *   "evidence": "어떤 문장과 키워드가 일치하는지 설명",
-     *   "reason": "최종 판단 근거"
-     * }
-     */
     private EvaluationResult parseEvaluationResult(String rawResponse,
                                                    String requirementText,
                                                    Long requirementId) {
+
         if (rawResponse == null || rawResponse.isBlank()) {
-            throw new IllegalStateException("OpenAI 응답이 비어 있습니다.");
+            throw new ApiException("OpenAI 응답이 비어 있음");
         }
 
         try {
             JsonNode root = objectMapper.readTree(rawResponse);
 
-            // ChatCompletion 구조에서 content 추출
             JsonNode contentNode = root
                     .path("choices")
                     .path(0)
@@ -129,31 +132,39 @@ public class LlmService {
             String content = contentNode.asText("");
 
             if (content.isBlank()) {
-                throw new IllegalStateException("OpenAI 응답에서 content를 찾을 수 없습니다.");
+                throw new ApiException("OpenAI 응답에서 content를 읽지 못함");
             }
 
-            JsonNode resultJson = objectMapper.readTree(content);
+            // JSON 블록만 추출
+            Matcher matcher = JSON_EXTRACT_PATTERN.matcher(content);
 
-            String status = resultJson.path("status").asText("NOT_FULFILLED");
-            double score = resultJson.path("score").asDouble(0.0);
-            int matchedKeywordCount = resultJson.path("matchedKeywordCount").asInt(0);
-            int totalKeywordCount = resultJson.path("totalKeywordCount").asInt(0);
-            String evidence = resultJson.path("evidence").asText("");
-            String reason = resultJson.path("reason").asText(evidence); // reason이 없으면 evidence로 대체
+            if (!matcher.find()) {
+                throw new ApiException("OpenAI 응답에서 JSON 형식 발견 실패");
+            }
+
+            String jsonText = matcher.group();
+
+            // JSON → Node
+            JsonNode json = objectMapper.readTree(jsonText);
+
+            String status = json.path("status").asText("NOT_FULFILLED");
+            String evidence = json.path("evidence").asText("");
+
+            double computedScore = 0.0;
 
             return new EvaluationResult(
-                    requirementId,          // 현재 구조로는 항상 null
+                    requirementId,
                     requirementText,
                     status,
-                    score,
-                    matchedKeywordCount,
-                    totalKeywordCount,
+                    computedScore,
+                    0,
+                    0,
                     evidence,
-                    reason
+                    evidence
             );
 
-        } catch (IOException e) {
-            throw new RuntimeException("OpenAI 응답 파싱 실패: " + e.getMessage(), e);
+        } catch (Exception e) {
+            throw new ApiException("OpenAI 응답 파싱 실패: " + e.getMessage());
         }
     }
 }
