@@ -8,9 +8,9 @@ Closes #ISSUE_NUMBER
 - change 1
 - change 2
 
-## How to Test
-1. Steps to test the feature
-2. Expected results
+## Details
+- Detail 1
+- Detail 2
 
 ## Checklist
 - [ ] Code builds
