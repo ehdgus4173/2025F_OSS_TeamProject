@@ -12,6 +12,10 @@ jobs:
     permissions:
       contents: read
 
+    defaults:
+      run:
+        working-directory: checkmate
+
     steps:
       - uses: actions/checkout@v4
 
